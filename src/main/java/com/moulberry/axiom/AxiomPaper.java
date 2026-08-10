@@ -231,7 +231,9 @@ public class AxiomPaper extends JavaPlugin implements Listener {
         } catch (IOException ignored) {}
         ServerHeightmaps.load(heightmapsPath);
 
-        Bukkit.getScheduler().scheduleSyncRepeatingTask(this, this::tick, 1, 1);
+        // Global repeating task. On Paper this runs on the main thread, on Folia it runs
+        // on the global region thread. World/entity work is dispatched per-region below.
+        Environment.runGlobalFixedRate(this, this::tick, 1, 1);
 
         this.sendMarkers = this.configuration.getBoolean("send-markers");
         this.maxChunkRelightsPerTick = this.configuration.getInt("max-chunk-relights-per-tick");
@@ -444,9 +446,9 @@ public class AxiomPaper extends JavaPlugin implements Listener {
             }
         }
 
-        this.operationQueue.tick();
+        this.operationQueue.tick(this);
 
-        WorldExtension.tick(MinecraftServer.getServer(), this.sendMarkers, this.maxChunkRelightsPerTick, this.maxChunkSendsPerTick);
+        WorldExtension.tickAll(this, this.sendMarkers, this.maxChunkRelightsPerTick, this.maxChunkSendsPerTick);
 
         ImplServerCustomBlocks.tick();
         ImplServerCustomDisplays.tick();
@@ -826,6 +828,14 @@ public class AxiomPaper extends JavaPlugin implements Listener {
 
     public boolean canUseAxiom(Player player) {
         return this.activeAxiomPlayers.contains(player.getUniqueId());
+    }
+
+    public boolean canUseAxiom(ServerPlayer player) {
+        return this.activeAxiomPlayers.contains(player.getUUID());
+    }
+
+    public boolean canUseAxiom(UUID uuid) {
+        return this.activeAxiomPlayers.contains(uuid);
     }
 
     public boolean canUseAxiom(Player player, AxiomPermission axiomPermission) {
