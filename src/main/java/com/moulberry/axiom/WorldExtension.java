@@ -5,7 +5,10 @@ import com.moulberry.axiom.marker.MarkerData;
 import com.moulberry.axiom.paperapi.entity.ImplAxiomHiddenEntities;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
-import it.unimi.dsi.fastutil.longs.*;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.minecraft.network.FriendlyByteBuf;
@@ -25,11 +28,19 @@ import org.bukkit.craftbukkit.CraftWorld;
 import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.entity.Player;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class WorldExtension {
 
-    private static final Map<ResourceKey<Level>, WorldExtension> extensions = new HashMap<>();
+    private static final Map<ResourceKey<Level>, WorldExtension> extensions = new ConcurrentHashMap<>();
 
     public static WorldExtension get(ServerLevel serverLevel) {
         WorldExtension extension = extensions.computeIfAbsent(serverLevel.dimension(), k -> new WorldExtension());
@@ -46,19 +57,40 @@ public class WorldExtension {
         }
     }
 
-    public static void tick(MinecraftServer server, boolean sendMarkers, int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
-        extensions.keySet().retainAll(server.levelKeys());
+    /**
+     * Called on the global region thread (Paper main thread / Folia global thread).
+     * Scheduling is split per-region so world attempts only ever touch ownership
+     * of their own chunks.
+     */
+    public static void tickAll(AxiomPaper plugin, boolean sendMarkers, int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
+        MinecraftServer server = MinecraftServer.getServer();
+        Set<ResourceKey<Level>> levelKeys = server.levelKeys();
 
-        for (ServerLevel level : server.getAllLevels()) {
-            get(level).tick(sendMarkers, maxChunkRelightsPerTick, maxChunkSendsPerTick);
+        var iterator = extensions.entrySet().iterator();
+        while (iterator.hasNext()) {
+            var entry = iterator.next();
+            if (!levelKeys.contains(entry.getKey())) {
+                iterator.remove();
+                continue;
+            }
+            entry.getValue().tick(plugin, sendMarkers, maxChunkRelightsPerTick, maxChunkSendsPerTick);
         }
+    }
+
+    private void tick(AxiomPaper plugin, boolean sendMarkers, int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
+        if (sendMarkers) {
+            this.scheduleMarkerTick(plugin);
+            this.processMarkerResults();
+        }
+        this.scheduleChunkTick(plugin, maxChunkRelightsPerTick, maxChunkSendsPerTick);
     }
 
     private ServerLevel level;
 
-    private final LongSet pendingChunksToSend = new LongOpenHashSet();
-    private final LongSet pendingChunksToLight = new LongOpenHashSet();
-    private final Map<UUID, MarkerData> previousMarkerData = new HashMap<>();
+    private final Set<Long> pendingChunksToSend = ConcurrentHashMap.newKeySet();
+    private final Set<Long> pendingChunksToLight = ConcurrentHashMap.newKeySet();
+    private final Map<UUID, MarkerData> previousMarkerData = new ConcurrentHashMap<>();
+    private final Map<UUID, MarkerData> computedMarkerData = new ConcurrentHashMap<>();
 
     public void sendChunk(int cx, int cz) {
         this.pendingChunksToSend.add(ChunkPos.pack(cx, cz));
@@ -89,67 +121,61 @@ public class WorldExtension {
         } catch (Throwable ignored) {}
     }
 
-    public void tick(boolean sendMarkers, int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
-        if (sendMarkers) {
-            this.tickMarkers();
+    private void scheduleChunkTick(AxiomPaper plugin, int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
+        if (this.pendingChunksToSend.isEmpty() && this.pendingChunksToLight.isEmpty()) {
+            return;
         }
-        this.tickChunkRelight(maxChunkRelightsPerTick, maxChunkSendsPerTick);
-    }
 
-    private void tickMarkers() {
-        List<MarkerData> changedData = new ArrayList<>();
+        World world = this.level.getWorld();
 
-        Set<UUID> allMarkers = new HashSet<>();
+        // Group chunks to send by the region that owns them, then run one task per region.
+        if (!this.pendingChunksToSend.isEmpty()) {
+            Map<Long, LongArrayList> byRegion = new HashMap<>();
+            for (long packed : this.pendingChunksToSend) {
+                int cx = ChunkPos.getX(packed);
+                int cz = ChunkPos.getZ(packed);
+                byRegion.computeIfAbsent(packRegion(cx, cz), k -> new LongArrayList()).add(packed);
+            }
 
-        for (Entity entity : this.level.getEntities().getAll()) {
-            if (entity instanceof Marker marker) {
-                if (ImplAxiomHiddenEntities.isMarkerHidden((org.bukkit.entity.Marker) marker.getBukkitEntity())) {
-                    continue;
-                }
-
-                MarkerData currentData = MarkerData.createFrom(marker);
-
-                MarkerData previousData = this.previousMarkerData.get(marker.getUUID());
-                if (!Objects.equals(currentData, previousData)) {
-                    this.previousMarkerData.put(marker.getUUID(), currentData);
-                    changedData.add(currentData);
-                }
-
-                allMarkers.add(marker.getUUID());
+            for (Map.Entry<Long, LongArrayList> entry : byRegion.entrySet()) {
+                long region = entry.getKey();
+                int anchorChunkX = getRegionX(region) << 5;
+                int anchorChunkZ = getRegionZ(region) << 5;
+                LongArrayList chunks = entry.getValue();
+                Environment.runOnRegion(plugin, world, anchorChunkX, anchorChunkZ, () -> sendChunks(chunks, maxChunkSendsPerTick));
             }
         }
 
-        Set<UUID> missingUuids = new HashSet<>(this.previousMarkerData.keySet());
-        missingUuids.removeAll(allMarkers);
-        this.previousMarkerData.keySet().removeAll(missingUuids);
-
-        if (!changedData.isEmpty() || !missingUuids.isEmpty()) {
-            FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
-            buf.writeCollection(changedData, MarkerData::write);
-            buf.writeCollection(missingUuids, (buffer, uuid) -> buffer.writeUUID(uuid));
-            byte[] bytes = ByteBufUtil.getBytes(buf);
-
-            List<ServerPlayer> players = new ArrayList<>();
-
-            for (ServerPlayer player : this.level.players()) {
-                if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
-                    players.add(player);
-                }
+        // Group chunks to relight by the region that owns them.
+        if (!this.pendingChunksToLight.isEmpty()) {
+            Map<Long, Set<ChunkPos>> byRegion = new HashMap<>();
+            for (long packed : this.pendingChunksToLight) {
+                int cx = ChunkPos.getX(packed);
+                int cz = ChunkPos.getZ(packed);
+                byRegion.computeIfAbsent(packRegion(cx, cz), k -> new HashSet<>()).add(new ChunkPos(cx, cz));
             }
 
-            VersionHelper.sendCustomPayloadToAll(players, "axiom:marker_data", bytes);
+            for (Map.Entry<Long, Set<ChunkPos>> entry : byRegion.entrySet()) {
+                long region = entry.getKey();
+                int anchorChunkX = getRegionX(region) << 5;
+                int anchorChunkZ = getRegionZ(region) << 5;
+                Set<ChunkPos> chunks = entry.getValue();
+                Environment.runOnRegion(plugin, world, anchorChunkX, anchorChunkZ, () -> relightChunks(chunks, maxChunkRelightsPerTick));
+            }
         }
     }
 
-    private void tickChunkRelight(int maxChunkRelightsPerTick, int maxChunkSendsPerTick) {
+    private void sendChunks(LongArrayList packedChunks, int maxChunkSendsPerTick) {
+        // Runs on the region that owns these chunks.
         ChunkMap chunkMap = this.level.getChunkSource().chunkMap;
 
         boolean sendAll = maxChunkSendsPerTick <= 0;
+        LongSet sent = new LongOpenHashSet();
 
-        // Send chunks
-        LongIterator longIterator = this.pendingChunksToSend.longIterator();
+        LongIterator longIterator = packedChunks.longIterator();
         while (longIterator.hasNext()) {
-            ChunkPos chunkPos = ChunkPos.unpack(longIterator.nextLong());
+            long packed = longIterator.nextLong();
+            ChunkPos chunkPos = ChunkPos.unpack(packed);
 
             LevelChunk chunk = this.level.getChunkIfLoaded(chunkPos.x(), chunkPos.z());
             if (chunk == null) {
@@ -166,40 +192,125 @@ public class WorldExtension {
                 player.connection.send(packet);
             }
 
-            if (!sendAll) {
-                longIterator.remove();
+            sent.add(packed);
 
+            if (!sendAll) {
                 maxChunkSendsPerTick -= 1;
                 if (maxChunkSendsPerTick <= 0) {
                     break;
                 }
             }
         }
+
         if (sendAll) {
-            this.pendingChunksToSend.clear();
+            this.pendingChunksToSend.removeAll(packedChunks);
+        } else if (!sent.isEmpty()) {
+            this.pendingChunksToSend.removeAll(sent);
+        }
+    }
+
+    private void relightChunks(Set<ChunkPos> chunks, int maxChunkRelightsPerTick) {
+        // Runs on the region that owns these chunks.
+        Set<ChunkPos> chunkSet = new HashSet<>();
+        if (maxChunkRelightsPerTick <= 0) {
+            chunkSet = chunks;
+        } else {
+            var iterator = chunks.iterator();
+            while (iterator.hasNext() && maxChunkRelightsPerTick > 0) {
+                chunkSet.add(iterator.next());
+                maxChunkRelightsPerTick -= 1;
+            }
         }
 
-        // Relight chunks
-        Set<ChunkPos> chunkSet = new HashSet<>();
-        longIterator = this.pendingChunksToLight.longIterator();
-        if (maxChunkRelightsPerTick <= 0) {
-            while (longIterator.hasNext()) {
-                chunkSet.add(ChunkPos.unpack(longIterator.nextLong()));
-            }
-            this.pendingChunksToLight.clear();
-        } else {
-            while (longIterator.hasNext()) {
-                chunkSet.add(ChunkPos.unpack(longIterator.nextLong()));
-                longIterator.remove();
+        if (chunkSet.isEmpty()) {
+            return;
+        }
 
-                maxChunkRelightsPerTick -= 1;
-                if (maxChunkRelightsPerTick <= 0) {
-                    break;
-                }
-            }
+        for (ChunkPos chunkPos : chunkSet) {
+            this.pendingChunksToLight.remove(ChunkPos.pack(chunkPos.x(), chunkPos.z()));
         }
 
         this.level.getChunkSource().getLightEngine().starlight$serverRelightChunks(chunkSet, pos -> {}, count -> {});
+    }
+
+    private void scheduleMarkerTick(AxiomPaper plugin) {
+        // The entity list itself is safe to iterate; marker data must be read on the
+        // region thread that owns each marker on Folia, so we hop per-entity.
+        try {
+            for (Entity entity : this.level.getEntities().getAll()) {
+                if (entity instanceof Marker marker) {
+                    if (ImplAxiomHiddenEntities.isMarkerHidden(marker.getUUID())) {
+                        continue;
+                    }
+                    Environment.runOnEntityRegion(plugin, marker, () -> {
+                        if (marker.isRemoved()) {
+                            return;
+                        }
+                        if (ImplAxiomHiddenEntities.isMarkerHidden(marker.getUUID())) {
+                            return;
+                        }
+                        this.computedMarkerData.put(marker.getUUID(), MarkerData.createFrom(marker));
+                    });
+                }
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private void processMarkerResults() {
+        if (this.computedMarkerData.isEmpty()) {
+            return;
+        }
+
+        Map<UUID, MarkerData> computed = new HashMap<>(this.computedMarkerData);
+        this.computedMarkerData.clear();
+
+        List<MarkerData> changedData = new ArrayList<>();
+
+        for (Map.Entry<UUID, MarkerData> entry : computed.entrySet()) {
+            UUID uuid = entry.getKey();
+            MarkerData currentData = entry.getValue();
+
+            MarkerData previousData = this.previousMarkerData.get(uuid);
+            if (!Objects.equals(currentData, previousData)) {
+                this.previousMarkerData.put(uuid, currentData);
+                changedData.add(currentData);
+            }
+        }
+
+        Set<UUID> missingUuids = new HashSet<>(this.previousMarkerData.keySet());
+        missingUuids.removeAll(computed.keySet());
+        this.previousMarkerData.keySet().removeAll(missingUuids);
+
+        if (changedData.isEmpty() && missingUuids.isEmpty()) {
+            return;
+        }
+
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
+        buf.writeCollection(changedData, MarkerData::write);
+        buf.writeCollection(missingUuids, (buffer, uuid) -> buffer.writeUUID(uuid));
+        byte[] bytes = ByteBufUtil.getBytes(buf);
+
+        List<ServerPlayer> players = new ArrayList<>();
+
+        for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
+            if (player.level() == this.level && AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
+                players.add(player);
+            }
+        }
+
+        VersionHelper.sendCustomPayloadToAll(players, "axiom:marker_data", bytes);
+    }
+
+    private static long packRegion(int chunkX, int chunkZ) {
+        return ((long) (chunkX >> 5) << 32) | (chunkZ >> 5 & 0xFFFFFFFFL);
+    }
+
+    private static int getRegionX(long region) {
+        return (int) (region >> 32);
+    }
+
+    private static int getRegionZ(long region) {
+        return (int) region;
     }
 
 }
