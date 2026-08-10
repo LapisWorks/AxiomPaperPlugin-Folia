@@ -1,6 +1,7 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.annotations.AnnotationUpdateAction;
 import com.moulberry.axiom.annotations.ServerAnnotations;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -42,8 +43,11 @@ public class UpdateAnnotationPacketListener implements PacketHandler {
             }
         }
 
-        // Execute
-        serverPlayer.level().getServer().execute(() -> {
+        // Execute on the region of the player so world state can be touched safely.
+        var world = serverPlayer.level().getWorld();
+        int chunkX = serverPlayer.getBlockX() >> 4;
+        int chunkZ = serverPlayer.getBlockZ() >> 4;
+        Environment.runOnRegion(this.plugin, world, chunkX, chunkZ, () -> {
             try {
                 ServerAnnotations.handleUpdates(serverPlayer.level().getWorld(), actions);
             } catch (Throwable t) {

@@ -124,7 +124,7 @@ public class ServerAnnotations {
         List<ServerPlayer> playersWithAxiom = new ArrayList<>();
 
         for (ServerPlayer player : ((CraftWorld)world).getHandle().players()) {
-            if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+            if (AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
                 playersWithAxiom.add(player);
             }
         }
