@@ -1,6 +1,7 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.marker.MarkerData;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -40,7 +41,16 @@ public class MarkerNbtRequestPacketListener implements PacketHandler {
         ServerLevel serverLevel = ((CraftWorld)player.getWorld()).getHandle();
 
         Entity entity = serverLevel.getEntity(uuid);
-        if (entity instanceof Marker marker) {
+        if (entity == null) {
+            return;
+        }
+
+        // Marker data must be read on the region that owns the marker (Folia).
+        Environment.runOnEntityRegion(this.plugin, entity, () -> {
+            if (entity.isRemoved() || !(entity instanceof Marker marker)) {
+                return;
+            }
+
             CompoundTag data = MarkerData.getData(marker);
 
             FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.buffer());
@@ -49,7 +59,7 @@ public class MarkerNbtRequestPacketListener implements PacketHandler {
 
             byte[] bytes = ByteBufUtil.getBytes(buf);
             VersionHelper.sendCustomPayload(player, "axiom:marker_nbt_response", bytes);
-        }
+        });
     }
 
 }

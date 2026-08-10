@@ -1,6 +1,7 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.integration.Integration;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -49,11 +50,6 @@ public class RequestEntityDataPacketListener implements PacketHandler {
         List<UUID> request = friendlyByteBuf.readCollection(this.plugin.limitCollection(ArrayList::new), buf -> buf.readUUID());
         ServerLevel serverLevel = player.level();
 
-        final int maxPacketSize = 0x100000;
-        int remainingBytes = maxPacketSize;
-
-        Map<UUID, CompoundTag> entityData = new HashMap<>();
-
         Set<UUID> visitedEntities = new HashSet<>();
 
         for (UUID uuid : request) {
@@ -70,33 +66,26 @@ public class RequestEntityDataPacketListener implements PacketHandler {
                 continue;
             }
 
-            if (!Integration.canPlaceBlock(bukkitPlayer, new Location(bukkitPlayer.getWorld(),
-                    entity.getBlockX(), entity.getBlockY(), entity.getBlockZ()))) {
-                continue;
-            }
+            // Entity data must be read on the region that owns the entity (Folia).
+            Environment.runOnEntityRegion(this.plugin, entity, () -> {
+                if (entity.isRemoved()) {
+                    return;
+                }
 
-            var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entity.registryAccess());
-            var entityTag = entity.save(valueOutput) ? valueOutput.buildResult() : null;
-            if (entityTag != null) {
-                int size = entityTag.sizeInBytes();
-                if (size >= maxPacketSize) {
+                if (!Integration.canPlaceBlock(bukkitPlayer, new Location(bukkitPlayer.getWorld(),
+                        entity.getBlockX(), entity.getBlockY(), entity.getBlockZ()))) {
+                    return;
+                }
+
+                var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entity.registryAccess());
+                var entityTag = entity.save(valueOutput) ? valueOutput.buildResult() : null;
+                if (entityTag != null) {
                     sendResponse(player, id, false, Map.of(uuid, entityTag));
-                    continue;
                 }
-
-                // Send partial packet if we've run out of available bytes
-                if (remainingBytes - size < 0) {
-                    sendResponse(player, id, false, entityData);
-                    entityData.clear();
-                    remainingBytes = maxPacketSize;
-                }
-
-                entityData.put(uuid, entityTag);
-                remainingBytes -= size;
-            }
+            });
         }
 
-        sendResponse(player, id, true, entityData);
+        sendResponse(player, id, true, Map.of());
     }
 
     private static void sendResponse(ServerPlayer player, long id, boolean finished, Map<UUID, CompoundTag> map) {

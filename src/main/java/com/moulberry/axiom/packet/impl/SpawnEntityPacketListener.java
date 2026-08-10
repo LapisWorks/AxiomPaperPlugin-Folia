@@ -1,6 +1,7 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.NbtSanitization;
 import com.moulberry.axiom.event.AxiomSpawnEntityEvent;
 import com.moulberry.axiom.integration.Integration;
@@ -72,71 +73,83 @@ public class SpawnEntityPacketListener implements PacketHandler {
                 continue;
             }
 
-            if (!Integration.canPlaceBlock(player, new Location(player.getWorld(),
-                    blockPos.getX(), blockPos.getY(), blockPos.getZ()))) {
-                continue;
-            }
+            int chunkX = blockPos.getX() >> 4;
+            int chunkZ = blockPos.getZ() >> 4;
 
-            if (serverLevel.getEntity(entry.newUuid) != null) continue;
-
-            CompoundTag tag = entry.tag == null ? new CompoundTag() : entry.tag;
-
-            NbtSanitization.sanitizeEntity(tag);
-
-            if (entry.copyFrom != null) {
-                Entity entityCopyFrom = serverLevel.getEntity(entry.copyFrom);
-                if (entityCopyFrom != null) {
-                    var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entityCopyFrom.registryAccess());
-                    CompoundTag saved = entityCopyFrom.saveAsPassenger(valueOutput) ? valueOutput.buildResult() : null;
-                    if (saved != null) {
-                        saved.remove("Dimension");
-                        tag = tag.merge(saved);
-                    }
-                }
-            }
-
-            if (!tag.contains("id")) continue;
-
-            AtomicBoolean useNewUuid = new AtomicBoolean(true);
-
-            var spawnRequest = new EntitySpawnRequest(EntitySpawnReason.COMMAND, true);
-            Entity spawned = EntityType.loadEntityRecursive(tag, serverLevel, spawnRequest, entity -> {
-                if (!this.plugin.canEntityBeManipulated(entity.getType())) {
-                    return null;
+            // Spawning must run on the region that owns the spawn location (Folia).
+            Environment.runOnRegion(this.plugin, serverLevel.getWorld(), chunkX, chunkZ, () -> {
+                if (!Integration.canPlaceBlock(player, new Location(player.getWorld(),
+                        blockPos.getX(), blockPos.getY(), blockPos.getZ()))) {
+                    return;
                 }
 
-                if (useNewUuid.getAndSet(false)) {
-                    entity.setUUID(entry.newUuid);
-                } else {
-                    entity.setUUID(UUID.randomUUID());
-                }
-
-                if (entity instanceof HangingEntity hangingEntity) {
-                    float changedYaw = entry.yaw - entity.getYRot();
-                    int rotations = Math.round(changedYaw / 90);
-                    hangingEntity.rotate(ROTATION_VALUES[rotations & 3]);
-
-                    if (entity instanceof ItemFrame itemFrame && itemFrame.getDirection().getAxis() == Direction.Axis.Y) {
-                        itemFrame.setRotation(itemFrame.getRotation() - Math.round(changedYaw / 45));
-                    }
-                }
-
-                entity.snapTo(position.x, position.y, position.z, entry.yaw, entry.pitch);
-                entity.setYHeadRot(entity.getYRot());
-
-                return entity;
+                spawnEntry(player, serverLevel, entry, position);
             });
+        }
+    }
 
-            if (spawned != null) {
-                if (serverLevel.tryAddFreshEntityWithPassengers(spawned)) {
-                    AxiomSpawnEntityEvent spawnEntityEvent = new AxiomSpawnEntityEvent(player, spawned.getBukkitEntity());
-                    Bukkit.getPluginManager().callEvent(spawnEntityEvent);
-                    if (spawnEntityEvent.isCancelled() || spawned.isRemoved()) {
-                        for (Entity passenger : spawned.getIndirectPassengers()) {
-                            passenger.discard();
-                        }
-                        spawned.discard();
+    private void spawnEntry(Player player, ServerLevel serverLevel, SpawnEntry entry, Vec3 position) {
+        BlockPos blockPos = BlockPos.containing(position);
+
+        if (serverLevel.getEntity(entry.newUuid) != null) return;
+
+        CompoundTag tag = entry.tag == null ? new CompoundTag() : entry.tag;
+
+        NbtSanitization.sanitizeEntity(tag);
+
+        if (entry.copyFrom != null) {
+            Entity entityCopyFrom = serverLevel.getEntity(entry.copyFrom);
+            if (entityCopyFrom != null) {
+                var valueOutput = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, entityCopyFrom.registryAccess());
+                CompoundTag saved = entityCopyFrom.saveAsPassenger(valueOutput) ? valueOutput.buildResult() : null;
+                if (saved != null) {
+                    saved.remove("Dimension");
+                    tag = tag.merge(saved);
+                }
+            }
+        }
+
+        if (!tag.contains("id")) return;
+
+        AtomicBoolean useNewUuid = new AtomicBoolean(true);
+
+        var spawnRequest = new EntitySpawnRequest(EntitySpawnReason.COMMAND, true);
+        Entity spawned = EntityType.loadEntityRecursive(tag, serverLevel, spawnRequest, entity -> {
+            if (!this.plugin.canEntityBeManipulated(entity.getType())) {
+                return null;
+            }
+
+            if (useNewUuid.getAndSet(false)) {
+                entity.setUUID(entry.newUuid);
+            } else {
+                entity.setUUID(UUID.randomUUID());
+            }
+
+            if (entity instanceof HangingEntity hangingEntity) {
+                float changedYaw = entry.yaw - entity.getYRot();
+                int rotations = Math.round(changedYaw / 90);
+                hangingEntity.rotate(ROTATION_VALUES[rotations & 3]);
+
+                if (entity instanceof ItemFrame itemFrame && itemFrame.getDirection().getAxis() == Direction.Axis.Y) {
+                    itemFrame.setRotation(itemFrame.getRotation() - Math.round(changedYaw / 45));
+                }
+            }
+
+            entity.snapTo(position.x, position.y, position.z, entry.yaw, entry.pitch);
+            entity.setYHeadRot(entity.getYRot());
+
+            return entity;
+        });
+
+        if (spawned != null) {
+            if (serverLevel.tryAddFreshEntityWithPassengers(spawned)) {
+                AxiomSpawnEntityEvent spawnEntityEvent = new AxiomSpawnEntityEvent(player, spawned.getBukkitEntity());
+                Bukkit.getPluginManager().callEvent(spawnEntityEvent);
+                if (spawnEntityEvent.isCancelled() || spawned.isRemoved()) {
+                    for (Entity passenger : spawned.getIndirectPassengers()) {
+                        passenger.discard();
                     }
+                    spawned.discard();
                 }
             }
         }

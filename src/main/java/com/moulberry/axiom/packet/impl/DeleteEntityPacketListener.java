@@ -1,6 +1,7 @@
 package com.moulberry.axiom.packet.impl;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.event.AxiomRemoveEntityEvent;
 import com.moulberry.axiom.integration.Integration;
 import com.moulberry.axiom.packet.PacketHandler;
@@ -39,24 +40,33 @@ public class DeleteEntityPacketListener implements PacketHandler {
 
         for (UUID uuid : delete) {
             Entity entity = serverLevel.getEntity(uuid);
-            if (entity == null || entity instanceof net.minecraft.world.entity.player.Player || entity.hasPassenger(e -> e instanceof net.minecraft.world.entity.player.Player)) continue;
-
-            if (!this.plugin.canEntityBeManipulated(entity.getType())) {
+            if (entity == null) {
                 continue;
             }
 
-            if (!Integration.canBreakBlock(player,
-                    player.getWorld().getBlockAt(entity.getBlockX(), entity.getBlockY(), entity.getBlockZ()))) {
-                continue;
-            }
+            // Removal must run on the region that owns the entity (Folia).
+            Environment.runOnEntityRegion(this.plugin, entity, () -> {
+                if (entity.isRemoved() || entity instanceof net.minecraft.world.entity.player.Player ||
+                        entity.hasPassenger(e -> e instanceof net.minecraft.world.entity.player.Player)) {
+                    return;
+                }
 
+                if (!this.plugin.canEntityBeManipulated(entity.getType())) {
+                    return;
+                }
 
-            AxiomRemoveEntityEvent removeEntityEvent = new AxiomRemoveEntityEvent(player, entity.getBukkitEntity());
-            Bukkit.getPluginManager().callEvent(removeEntityEvent);
+                if (!Integration.canBreakBlock(player,
+                        player.getWorld().getBlockAt(entity.getBlockX(), entity.getBlockY(), entity.getBlockZ()))) {
+                    return;
+                }
 
-            if (!removeEntityEvent.isCancelled()) {
-                entity.remove(Entity.RemovalReason.DISCARDED);
-            }
+                AxiomRemoveEntityEvent removeEntityEvent = new AxiomRemoveEntityEvent(player, entity.getBukkitEntity());
+                Bukkit.getPluginManager().callEvent(removeEntityEvent);
+
+                if (!removeEntityEvent.isCancelled()) {
+                    entity.remove(Entity.RemovalReason.DISCARDED);
+                }
+            });
         }
     }
 
