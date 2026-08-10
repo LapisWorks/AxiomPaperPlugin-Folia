@@ -1,6 +1,7 @@
 package com.moulberry.axiom.paperapi.block;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.paperapi.AxiomAlreadyRegisteredException;
 import io.netty.buffer.ByteBufUtil;
@@ -33,7 +34,7 @@ public class ImplServerCustomBlocks {
     private static boolean hasRegisteredToAPlayer = false;
 
     public static void register(Plugin plugin, AxiomCustomBlockBuilder customBlockBuilder) throws AxiomAlreadyRegisteredException {
-        if (!MinecraftServer.getServer().isSameThread()) {
+        if (!Environment.isServerThread()) {
             throw new WrongThreadException();
         }
 
@@ -70,7 +71,7 @@ public class ImplServerCustomBlocks {
             byte[] registerPacketData = null;
             byte[] registerPacketDataMismatch = null;
             for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
-                if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                if (AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
                     int playerProtocolVersion = AxiomPaper.PLUGIN.getProtocolVersionFor(player.getUUID());
                     boolean protocolMismatch = playerProtocolVersion != SharedConstants.getProtocolVersion();
                     if (!protocolMismatch) {
@@ -119,7 +120,7 @@ public class ImplServerCustomBlocks {
             List<ServerPlayer> playersWithMismatchProtocol = new ArrayList<>();
 
             for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
-                if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                if (AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
                     int playerProtocolVersion = AxiomPaper.PLUGIN.getProtocolVersionFor(player.getUUID());
                     boolean protocolMismatch = playerProtocolVersion != SharedConstants.getProtocolVersion();
                     if (protocolMismatch) {

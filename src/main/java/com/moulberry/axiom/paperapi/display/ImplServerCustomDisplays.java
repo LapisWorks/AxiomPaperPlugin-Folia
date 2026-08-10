@@ -1,6 +1,7 @@
 package com.moulberry.axiom.paperapi.display;
 
 import com.moulberry.axiom.AxiomPaper;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.VersionHelper;
 import com.moulberry.axiom.paperapi.AxiomAlreadyRegisteredException;
 import com.moulberry.axiom.paperapi.block.AxiomCustomBlockBuilder;
@@ -35,7 +36,7 @@ public class ImplServerCustomDisplays {
     private static boolean hasRegisteredToAPlayer = false;
 
     public static void register(Plugin plugin, AxiomCustomDisplayBuilder customDisplayBuilder) throws AxiomAlreadyRegisteredException {
-        if (!MinecraftServer.getServer().isSameThread()) {
+        if (!Environment.isServerThread()) {
             throw new WrongThreadException();
         }
 
@@ -84,7 +85,7 @@ public class ImplServerCustomDisplays {
             List<ServerPlayer> players = new ArrayList<>();
 
             for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
-                if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                if (AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
                     int playerProtocolVersion = AxiomPaper.PLUGIN.getProtocolVersionFor(player.getUUID());
                     if (playerProtocolVersion == SharedConstants.getProtocolVersion()) {
                         players.add(player);
