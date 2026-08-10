@@ -18,10 +18,12 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class ImplAxiomHiddenEntities {
 
     private static final Set<Marker> hiddenMarkers = Collections.newSetFromMap(new WeakHashMap<>());
+    private static final Set<UUID> hiddenMarkerUuids = ConcurrentHashMap.newKeySet();
     private static final Map<Object, UUID> hiddenDisplays = new WeakHashMap<>();
     private static final Set<UUID> lastSentHiddenDisplays = new HashSet<>();
 
@@ -32,8 +34,13 @@ public class ImplAxiomHiddenEntities {
         return hiddenMarkers.contains(marker);
     }
 
+    public static boolean isMarkerHidden(UUID uuid) {
+        return hiddenMarkerUuids.contains(uuid);
+    }
+
     public static void hideMarkerGizmo(Marker marker) {
         hiddenMarkers.add(marker);
+        hiddenMarkerUuids.add(marker.getUniqueId());
     }
 
     public static void hideDisplayGizmo(Display display) {
@@ -60,7 +67,7 @@ public class ImplAxiomHiddenEntities {
             List<ServerPlayer> players = new ArrayList<>();
 
             for (ServerPlayer player : MinecraftServer.getServer().getPlayerList().getPlayers()) {
-                if (AxiomPaper.PLUGIN.canUseAxiom(player.getBukkitEntity())) {
+                if (AxiomPaper.PLUGIN.canUseAxiom(player.getUUID())) {
                     players.add(player);
                 }
             }
