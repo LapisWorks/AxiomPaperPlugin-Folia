@@ -2,6 +2,7 @@ package com.moulberry.axiom.operations;
 
 import com.moulberry.axiom.AxiomPaper;
 import com.moulberry.axiom.AxiomReflection;
+import com.moulberry.axiom.Environment;
 import com.moulberry.axiom.WorldExtension;
 import com.moulberry.axiom.buffer.BlockBuffer;
 import com.moulberry.axiom.buffer.CompressedBlockEntity;
@@ -37,7 +38,6 @@ import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.storage.TagValueInput;
-import org.bukkit.Chunk;
 import org.bukkit.craftbukkit.CraftChunk;
 
 import java.util.ArrayList;
@@ -47,6 +47,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class SetBlockBufferOperation implements PendingOperation {
 
@@ -55,16 +56,33 @@ public class SetBlockBufferOperation implements PendingOperation {
     private final BlockBuffer buffer;
     private final boolean allowNbt;
 
-    private Long2ObjectOpenHashMap<List<Long2ObjectMap.Entry<PalettedContainer<BlockState>>>> sectionsForChunks = null;
-    private LongArrayList getChunkFutures = null;
+    private final Long2ObjectOpenHashMap<List<Long2ObjectMap.Entry<PalettedContainer<BlockState>>>> sectionsForChunks;
+    private final LongArrayList getChunkFutures;
+    private final int totalChunks;
+    private final AtomicInteger processedChunks = new AtomicInteger(0);
+
     private List<CompletableFuture<LevelChunk>> chunkFutures = new ArrayList<>();
-    private boolean sendGameMasterBlockWarning = false;
-    private boolean finished = false;
+    private volatile boolean sendGameMasterBlockWarning = false;
+    private volatile boolean finished = false;
 
     public SetBlockBufferOperation(ServerPlayer player, BlockBuffer buffer, boolean allowNbt) {
         this.player = player;
         this.buffer = buffer;
         this.allowNbt = allowNbt;
+
+        this.sectionsForChunks = new Long2ObjectOpenHashMap<>();
+        for (Long2ObjectMap.Entry<PalettedContainer<BlockState>> entry : this.buffer.entrySet()) {
+            long pos = entry.getLongKey();
+            int posX = BlockPos.getX(pos);
+            int posZ = BlockPos.getZ(pos);
+
+            long chunkPos = ChunkPos.pack(posX, posZ);
+            this.sectionsForChunks.computeIfAbsent(chunkPos, k -> new ArrayList<>()).add(entry);
+        }
+
+        this.totalChunks = this.sectionsForChunks.size();
+        this.getChunkFutures = new LongArrayList(this.sectionsForChunks.keySet());
+        this.getChunkFutures.sort(LongComparators.NATURAL_COMPARATOR);
     }
 
     @Override
@@ -79,25 +97,14 @@ public class SetBlockBufferOperation implements PendingOperation {
 
     @Override
     public void tick(ServerLevel level) {
-        BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
-        WorldExtension extension = WorldExtension.get(level);
+        // Runs on the region thread of the executing player (see OperationQueue).
+        if (this.finished) {
+            return;
+        }
 
-        BlockState emptyState = BlockBuffer.EMPTY_STATE;
-
-        if (this.sectionsForChunks == null) {
-            this.sectionsForChunks = new Long2ObjectOpenHashMap<>();
-
-            for (Long2ObjectMap.Entry<PalettedContainer<BlockState>> entry : this.buffer.entrySet()) {
-                long pos = entry.getLongKey();
-                int posX = BlockPos.getX(pos);
-                int posZ = BlockPos.getZ(pos);
-
-                long chunkPos = ChunkPos.pack(posX, posZ);
-                this.sectionsForChunks.computeIfAbsent(chunkPos, k -> new ArrayList<>()).add(entry);
-            }
-
-            this.getChunkFutures = new LongArrayList(this.sectionsForChunks.keySet());
-            this.getChunkFutures.sort(LongComparators.NATURAL_COMPARATOR);
+        if (this.player.hasDisconnected()) {
+            this.finished = true;
+            return;
         }
 
         if (!this.getChunkFutures.isEmpty()) {
@@ -137,6 +144,18 @@ public class SetBlockBufferOperation implements PendingOperation {
             chunkFutureIterator.remove();
 
             LevelChunk chunk = future.join();
+            // Chunk mutations must run on the region that owns the chunk (Folia).
+            Environment.runOnRegion(AxiomPaper.PLUGIN, level.getWorld(), chunk.locX, chunk.locZ, () -> this.applyToChunk(level, chunk));
+        }
+    }
+
+    private void applyToChunk(ServerLevel level, LevelChunk chunk) {
+        // Runs on the region that owns this chunk.
+        try {
+            BlockPos.MutableBlockPos blockPos = new BlockPos.MutableBlockPos();
+            WorldExtension extension = WorldExtension.get(level);
+
+            BlockState emptyState = BlockBuffer.EMPTY_STATE;
 
             Heightmap worldSurface = null;
             Heightmap oceanFloor = null;
@@ -157,6 +176,12 @@ public class SetBlockBufferOperation implements PendingOperation {
 
             long chunkPosLong = ChunkPos.pack(chunk.locX, chunk.locZ);
             List<Long2ObjectMap.Entry<PalettedContainer<BlockState>>> sections = this.sectionsForChunks.get(chunkPosLong);
+            if (sections == null) {
+                return;
+            }
+
+            var bukkitPlayer = this.player.getBukkitEntity();
+
             for (Long2ObjectMap.Entry<PalettedContainer<BlockState>> entry : sections) {
                 int cx = BlockPos.getX(entry.getLongKey());
                 int cy = BlockPos.getY(entry.getLongKey());
@@ -167,7 +192,7 @@ public class SetBlockBufferOperation implements PendingOperation {
                     continue;
                 }
 
-                SectionPermissionChecker checker = Integration.checkSection(player.getBukkitEntity(), level.getWorld(), cx, cy, cz);
+                SectionPermissionChecker checker = Integration.checkSection(bukkitPlayer, level.getWorld(), cx, cy, cz);
                 if (checker != null && checker.noneAllowed()) {
                     continue;
                 }
@@ -264,13 +289,13 @@ public class SetBlockBufferOperation implements PendingOperation {
                                     }
                                 }
                                 if (blockEntity != null && blockEntityChunkMap != null) {
-                                    if (blockEntity instanceof GameMasterBlock && !player.canUseGameMasterBlocks()) {
-                                        sendGameMasterBlockWarning = true;
+                                    if (blockEntity instanceof GameMasterBlock && !this.player.canUseGameMasterBlocks()) {
+                                        this.sendGameMasterBlockWarning = true;
                                     } else {
                                         int key = x | (y << 4) | (z << 8);
                                         CompressedBlockEntity savedBlockEntity = blockEntityChunkMap.get((short) key);
                                         if (savedBlockEntity != null) {
-                                            var input = TagValueInput.create(ProblemReporter.DISCARDING, player.registryAccess(), savedBlockEntity.decompress());
+                                            var input = TagValueInput.create(ProblemReporter.DISCARDING, this.player.registryAccess(), savedBlockEntity.decompress());
                                             blockEntity.loadWithComponents(input);
                                             chunkChanged = true;
                                         }
@@ -281,7 +306,7 @@ public class SetBlockBufferOperation implements PendingOperation {
                             }
 
                             if (CoreProtectIntegration.isEnabled() && old != blockState) {
-                                String changedBy = player.getBukkitEntity().getName();
+                                String changedBy = this.player.getName().getString();
                                 BlockPos changedPos = new BlockPos(bx, by, bz);
 
                                 CoreProtectIntegration.logRemoval(changedBy, old, level.getWorld(), changedPos);
@@ -305,16 +330,16 @@ public class SetBlockBufferOperation implements PendingOperation {
             if (chunkLightChanged) {
                 extension.lightChunk(chunk.locX, chunk.locZ);
             }
-        }
+        } catch (Throwable t) {
+            this.player.getBukkitEntity().kick(net.kyori.adventure.text.Component.text("An error occurred while processing operation: " + t.getMessage()));
+        } finally {
+            if (this.processedChunks.incrementAndGet() == this.totalChunks) {
+                if (this.sendGameMasterBlockWarning) {
+                    this.player.sendSystemMessage(Component.literal("Unable to set data for Game Master block since you don't have op").withStyle(ChatFormatting.RED));
+                }
 
-        if (!this.getChunkFutures.isEmpty()) {
-            return;
+                this.finished = true;
+            }
         }
-
-        if (this.sendGameMasterBlockWarning) {
-            this.player.sendSystemMessage(Component.literal("Unable to set data for Game Master block since you don't have op").withStyle(ChatFormatting.RED));
-        }
-
-        this.finished = true;
     }
 }
