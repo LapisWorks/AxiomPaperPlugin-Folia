@@ -123,3 +123,6 @@ run/
 build
 .gradle
 /*.jar
+
+# Local user configuration (machine-specific paths)
+gradle.properties
